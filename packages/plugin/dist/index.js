@@ -101131,6 +101131,244 @@ var TransportUpgradeHost = class {
   }
 };
 
+// packages/plugin/src/result-only.ts
+var RESULT_ONLY_CAPABILITY = "remote.result.only.v1";
+var RESULT_ONLY_MARKER_TYPE = "log/omitted";
+var RESULT_ONLY_HISTORY_ENDPOINTS = /* @__PURE__ */ new Set([
+  "session/events",
+  "session/page",
+  "session/history",
+  "subagent/history"
+]);
+var DROPPED_PREFIXES = ["tool/", "step/", "subagent/", "job/", "session-log-deepseek/", "request/"];
+var DROPPED_TYPES = /* @__PURE__ */ new Set(["assistant/attempt", "todo/write", "llm/retry", "llm/retry-started"]);
+var isRecord22 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+function takeResultOnly(payload) {
+  if (!isRecord22(payload)) return { payload, resultOnly: false };
+  let resultOnly = false;
+  let changed = false;
+  const strip = (value) => {
+    if (!isRecord22(value) || !Object.hasOwn(value, "resultOnly")) return value;
+    if (value.resultOnly === true) resultOnly = true;
+    const next2 = { ...value };
+    delete next2.resultOnly;
+    changed = true;
+    return next2;
+  };
+  let next = strip(payload);
+  let nextArgs = strip(next.args);
+  let argsChanged = nextArgs !== next.args;
+  if (isRecord22(nextArgs)) {
+    let inner = nextArgs;
+    for (const key of ["request", "_request"]) {
+      if (!Object.hasOwn(inner, key)) continue;
+      const projected = strip(inner[key]);
+      if (projected === inner[key]) continue;
+      inner = { ...inner, [key]: projected };
+      argsChanged = true;
+    }
+    if (inner !== nextArgs) nextArgs = inner;
+  }
+  if (argsChanged) next = { ...next, args: nextArgs };
+  const request = strip(next.request);
+  if (request !== next.request) next = { ...next, request };
+  return { payload: changed ? next : payload, resultOnly };
+}
+function trimAssistantMessage(event) {
+  const data2 = isRecord22(event.data) ? event.data : void 0;
+  const message = data2 !== void 0 && isRecord22(data2.message) ? data2.message : void 0;
+  if (data2 === void 0 || message === void 0) return void 0;
+  const content = Array.isArray(message.content) ? message.content.filter((block) => isRecord22(block) && block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0) : [];
+  const text = typeof message.text === "string" && message.text.trim().length > 0 ? message.text : void 0;
+  if (content.length === 0 && text === void 0) return void 0;
+  const nextData = { ...data2 };
+  delete nextData.stream;
+  return {
+    ...event,
+    data: {
+      ...nextData,
+      message: { ...message, ...content.length === 0 ? {} : { content } }
+    }
+  };
+}
+function toolNameOf(event) {
+  const data2 = isRecord22(event.data) ? event.data : void 0;
+  if (data2 === void 0) return void 0;
+  for (const key of ["name", "toolName", "tool"]) {
+    const value = data2[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  const call = isRecord22(data2.call) ? data2.call : void 0;
+  return call !== void 0 && typeof call.name === "string" && call.name.length > 0 ? call.name : void 0;
+}
+function encodedLength(value) {
+  try {
+    return JSON.stringify(value)?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+var ResultOnlyFilter = class {
+  run;
+  /** Project one durable event; may return the marker before the kept event. */
+  push(event) {
+    const type = typeof event.type === "string" ? event.type : "";
+    const seq = typeof event.seq === "number" && Number.isFinite(event.seq) ? event.seq : void 0;
+    if (this.isDropped(type)) {
+      if (seq !== void 0) this.omit(event, type, seq);
+      return [];
+    }
+    if (type === "assistant/message") {
+      const trimmed = trimAssistantMessage(event);
+      if (trimmed === void 0) {
+        if (seq !== void 0) this.omit(event, type, seq);
+        return [];
+      }
+      const marker2 = this.takeRun();
+      return marker2 === void 0 ? [trimmed] : [marker2, trimmed];
+    }
+    const marker = this.takeRun();
+    return marker === void 0 ? [event] : [marker, event];
+  }
+  /** End the current run, if any, and return its marker. */
+  flush() {
+    return this.takeRun();
+  }
+  /** Project a follow snapshot in place; a trailing omission needs no marker. */
+  snapshot(value) {
+    this.run = void 0;
+    const next = { ...value };
+    if (Array.isArray(value.records)) next.records = this.filterEntries(value.records, false);
+    if (isRecord22(next.assistantStream)) {
+      const assistantStream = { ...next.assistantStream };
+      delete assistantStream.activeAttempt;
+      next.assistantStream = assistantStream;
+    }
+    this.run = void 0;
+    return next;
+  }
+  /** Project a records list; pages flush the run at the page edge. */
+  entries(records, flush = true) {
+    return this.filterEntries(records, flush);
+  }
+  /** Project a raw events list (session/events). */
+  events(events, flush = true) {
+    const out = [];
+    for (const event of events) {
+      if (!isRecord22(event)) {
+        out.push(event);
+        continue;
+      }
+      out.push(...this.push(event));
+    }
+    if (flush) {
+      const marker = this.takeRun();
+      if (marker !== void 0) out.push(marker);
+    }
+    return out;
+  }
+  filterEntries(records, flush) {
+    const out = [];
+    for (const record11 of records) {
+      if (isRecord22(record11) && isRecord22(record11.event)) {
+        for (const event of this.push(record11.event)) out.push({ ...record11, event });
+      } else if (isRecord22(record11)) {
+        for (const event of this.push(record11)) out.push(event);
+      } else {
+        out.push(record11);
+      }
+    }
+    if (flush) {
+      const marker = this.takeRun();
+      if (marker !== void 0) out.push({ type: "event", event: marker });
+    }
+    return out;
+  }
+  isDropped(type) {
+    return DROPPED_TYPES.has(type) || DROPPED_PREFIXES.some((prefix) => type.startsWith(prefix));
+  }
+  omit(event, type, seq) {
+    const data2 = isRecord22(event.data) ? event.data : void 0;
+    const run = this.run ?? {
+      fromSeq: seq,
+      seq,
+      count: 0,
+      bytes: 0,
+      kinds: [],
+      tools: []
+    };
+    run.fromSeq = Math.min(run.fromSeq, seq);
+    run.seq = Math.max(run.seq, seq);
+    run.count += 1;
+    run.bytes += encodedLength(event);
+    if (!run.kinds.includes(type) && run.kinds.length < 8) run.kinds.push(type);
+    const tool = toolNameOf(event);
+    if (tool !== void 0 && !run.tools.includes(tool) && run.tools.length < 8) run.tools.push(tool);
+    if (data2 !== void 0 && typeof data2.turn === "number") run.turn = data2.turn;
+    if (data2 !== void 0 && typeof data2.step === "number") run.step = data2.step;
+    if (typeof event.time === "number") run.time = event.time;
+    this.run = run;
+  }
+  takeRun() {
+    const run = this.run;
+    if (run === void 0) return void 0;
+    this.run = void 0;
+    return {
+      type: RESULT_ONLY_MARKER_TYPE,
+      seq: run.seq,
+      time: run.time ?? 0,
+      data: {
+        fromSeq: run.fromSeq,
+        count: run.count,
+        bytes: run.bytes,
+        kinds: run.kinds,
+        ...run.tools.length === 0 ? {} : { tools: run.tools },
+        ...run.turn === void 0 ? {} : { turn: run.turn },
+        ...run.step === void 0 ? {} : { step: run.step }
+      }
+    };
+  }
+};
+function filterResultOnly(endpoint, result) {
+  if (!RESULT_ONLY_HISTORY_ENDPOINTS.has(endpoint)) return result;
+  if (!isRecord22(result) || result.ok !== true || !isRecord22(result.value)) return result;
+  const value = result.value;
+  if (endpoint === "session/events" && Array.isArray(value.events)) {
+    return { ...result, value: { ...value, events: new ResultOnlyFilter().events(value.events) } };
+  }
+  if (Array.isArray(value.records)) {
+    return { ...result, value: { ...value, records: new ResultOnlyFilter().entries(value.records) } };
+  }
+  return result;
+}
+async function* resultOnlyStream(source, signal) {
+  const filter = new ResultOnlyFilter();
+  for await (const value of source) {
+    if (signal.aborted) return;
+    if (!isRecord22(value)) {
+      yield value;
+      continue;
+    }
+    if (value.type === "snapshot") {
+      yield filter.snapshot(value);
+      continue;
+    }
+    if (value.type === "event") {
+      if (!isRecord22(value.event)) {
+        yield value;
+        continue;
+      }
+      for (const event of filter.push(value.event)) yield { ...value, event };
+      continue;
+    }
+    if (value.type === "assistant-stream") continue;
+    yield value;
+  }
+  if (signal.aborted) return;
+  const marker = filter.flush();
+  if (marker !== void 0) yield { type: "event", event: marker };
+}
+
 // packages/plugin/src/rpc-router.ts
 var wireRequestSchema = external_exports.object({ method: external_exports.string().min(1), params: external_exports.unknown() }).strict();
 var emptyParamsSchema = external_exports.object({}).strict();
@@ -101281,7 +101519,7 @@ var RpcRouter = class {
         const capabilities = [.../* @__PURE__ */ new Set([
           ...hostCapabilities,
           "remote.history.compact.v1",
-          ...this.harnessRemote === void 0 || !remoteAvailable ? [] : ["harness.remote.stream.transfer.v1"],
+          ...this.harnessRemote === void 0 || !remoteAvailable ? [] : ["harness.remote.stream.transfer.v1", RESULT_ONLY_CAPABILITY],
           ...this.compaction === void 0 ? [] : [REMOTE_COMPACTION_CAPABILITY],
           ...this.workspaceUpload === void 0 || !hostCapabilities.includes("workspace.upload.v1") ? [] : [BINARY_UPLOAD_CAPABILITY, ...this.lanUpload ? [LAN_UPLOAD_CAPABILITY] : []],
           ...this.transportUpgrade === void 0 ? [] : [TRANSPORT_UPGRADE_CAPABILITY]
@@ -103330,6 +103568,8 @@ var HarnessRemoteBridge = class {
   terminalCarrier;
   async call(input4) {
     const params = callSchema3.parse(input4);
+    const extracted = RESULT_ONLY_HISTORY_ENDPOINTS.has(params.endpoint) ? takeResultOnly(params.payload) : { payload: params.payload, resultOnly: false };
+    params.payload = extracted.payload;
     if ((params.endpoint === "remoteUploads/upload" || params.endpoint === "remoteImages/upload") && this.uploadAttachment !== void 0) {
       const payload = external_exports.object({ args: external_exports.unknown() }).strict().parse(params.payload);
       return { ok: true, value: await this.uploadAttachment(payload.args) };
@@ -103382,9 +103622,10 @@ var HarnessRemoteBridge = class {
         durationMs: Math.round(performance.now() - startedAt)
       });
       const filteredResult = filterSessionListProjections(params.endpoint, result);
+      const resultOnlyResult = extracted.resultOnly ? filterResultOnly(params.endpoint, filteredResult) : filteredResult;
       const wireResult = normalizeWorkspaceBinaryResult2(
         params.endpoint,
-        this.compactHistoryEnabled && ["session/page", "session/events", "session/history", "subagent/history"].includes(params.endpoint) ? compactHistory(filteredResult) : filteredResult
+        this.compactHistoryEnabled && ["session/page", "session/events", "session/history", "subagent/history"].includes(params.endpoint) ? compactHistory(resultOnlyResult) : resultOnlyResult
       );
       return reservation === void 0 ? wireResult : this.terminal.result(params.endpoint, params.payload, wireResult, reservation);
     } catch (error62) {
@@ -103441,7 +103682,7 @@ var HarnessRemoteBridge = class {
       const record11 = await this.schedule.create(sessionId, request, AbortSignal.timeout(6e4));
       return { ok: true, value: record11 };
     } catch (error62) {
-      const published = isRecord22(error62) && typeof error62.code === "string" ? PUBLIC_SCHEDULE_ERRORS[error62.code] : void 0;
+      const published = isRecord23(error62) && typeof error62.code === "string" ? PUBLIC_SCHEDULE_ERRORS[error62.code] : void 0;
       if (published === void 0) {
         return {
           ok: false,
@@ -103563,6 +103804,8 @@ var HarnessRemoteBridge = class {
   }
   async openStream(input4) {
     const params = streamOpenSchema3.parse(input4);
+    const extracted = params.endpoint === "session/follow" ? takeResultOnly(params.payload) : { payload: params.payload, resultOnly: false };
+    params.payload = extracted.payload;
     this.assertAllowed(params.endpoint);
     if (params.endpoint.startsWith("pluginManager/")) throw new RpcError("METHOD_NOT_ALLOWED", "Plugin management endpoints are not streams.");
     if (params.endpoint.startsWith("cotTranslation/")) throw new RpcError("METHOD_NOT_ALLOWED", "Translation endpoints are not streams.");
@@ -103585,7 +103828,7 @@ var HarnessRemoteBridge = class {
       throw error62;
     }
     if (params.endpoint === "$events") source = this.remoteEventsWithFallback(source, controller.signal);
-    void this.pump(params.streamId, source, controller.signal, params.endpoint === "session/follow", params.transferFrames);
+    void this.pump(params.streamId, source, controller.signal, params.endpoint === "session/follow", params.transferFrames, extracted.resultOnly);
     return { opened: true, streamId: params.streamId };
   }
   async *remoteEventsWithFallback(source, signal) {
@@ -103659,8 +103902,8 @@ var HarnessRemoteBridge = class {
     const args = parsed.data.args;
     const result = await this.gateway.dispatch(plugin ? "pluginManager/listPlugins" : "pluginManager/listBundles", { args: {} }, AbortSignal.timeout(6e4));
     if (!result.ok || !Array.isArray(result.value)) throw new RpcError("PERMISSION_DENIED", "Cannot verify the Host plugin inventory.");
-    const row = result.value.find((value) => isRecord22(value) && value[plugin ? "entryId" : "name"] === args[key]);
-    if (!isRecord22(row) || row.readOnlyReason !== void 0) throw new RpcError("PERMISSION_DENIED", "The Host plugin cannot be changed remotely.");
+    const row = result.value.find((value) => isRecord23(value) && value[plugin ? "entryId" : "name"] === args[key]);
+    if (!isRecord23(row) || row.readOnlyReason !== void 0) throw new RpcError("PERMISSION_DENIED", "The Host plugin cannot be changed remotely.");
     if (remoteOwnedBundleRow(row, plugin)) {
       throw new RpcError("PERMISSION_DENIED", "The Remote plugin can only be enabled or disabled locally on the Host.");
     }
@@ -103680,8 +103923,8 @@ var HarnessRemoteBridge = class {
     if (!parsed.success) throw new RpcError("INVALID_MESSAGE", "Invalid plugin update request.");
     const result = await this.gateway.dispatch("pluginManager/listBundles", { args: {} }, AbortSignal.timeout(6e4));
     if (!result.ok || !Array.isArray(result.value)) throw new RpcError("PERMISSION_DENIED", "Cannot verify the Host plugin inventory.");
-    const row = result.value.find((value) => isRecord22(value) && value.name === parsed.data.args.name);
-    if (!isRecord22(row) || row.readOnlyReason !== void 0 || row.updatable !== true) {
+    const row = result.value.find((value) => isRecord23(value) && value.name === parsed.data.args.name);
+    if (!isRecord23(row) || row.readOnlyReason !== void 0 || row.updatable !== true) {
       throw new RpcError("PERMISSION_DENIED", "The Host plugin cannot be updated remotely.");
     }
     if (remoteOwnedBundleRow(row, false)) {
@@ -103696,11 +103939,11 @@ var HarnessRemoteBridge = class {
       throw new RpcError("FEATURE_NOT_SUPPORTED", "This Harness version does not support Remote event transport.");
     }
   }
-  async pump(streamId, source, signal, historyFollow = false, transferFrames = false) {
+  async pump(streamId, source, signal, historyFollow = false, transferFrames = false, resultOnly = false) {
     let reason = "completed";
     let failure5;
     try {
-      for await (const value of source) {
+      for await (const value of resultOnly ? resultOnlyStream(source, signal) : source) {
         if (signal.aborted) break;
         const frame = {
           streamId,
@@ -103771,7 +104014,7 @@ var HarnessRemoteBridge = class {
     }
   }
   async assertNativeWorkspaceFileCall(endpoint, payload, signal) {
-    const rootPayload = isRecord22(payload) ? payload : {};
+    const rootPayload = isRecord23(payload) ? payload : {};
     const args = requestArgs(payload);
     const sessionId = typeof args.workspaceFileScopeId === "string" ? args.workspaceFileScopeId : typeof args.sessionId === "string" ? args.sessionId : typeof args.agentId === "string" ? args.agentId : void 0;
     if (sessionId === void 0) {
@@ -103781,7 +104024,7 @@ var HarnessRemoteBridge = class {
     if (!sessionWorkspace) {
       throw workspaceFileFailure("WORKSPACE_UNAVAILABLE", "The workspace is unavailable.", "authority-unavailable");
     }
-    const options = isRecord22(args.options) ? args.options : void 0;
+    const options = isRecord23(args.options) ? args.options : void 0;
     const rawBaseFile = endpoint === "workspaceFiles/readBytes" ? typeof options?.baseFile === "string" ? options.baseFile : typeof args.baseFile === "string" ? args.baseFile : void 0 : void 0;
     if (endpoint === "workspaceFiles/readBytes") {
       if (options !== void 0 && "baseFile" in options && options.baseFile !== void 0 && typeof options.baseFile !== "string") {
@@ -103815,8 +104058,8 @@ var HarnessRemoteBridge = class {
       }
       safeRel = await this.verifyWorkspacePathContainment(sessionWorkspace.root, path, endpoint, sessionWorkspace.cwd);
     }
-    let finalArgs = isRecord22(rootPayload.args) ? { ...rootPayload.args, path: safeRel } : { ...rootPayload, path: safeRel };
-    if (isRecord22(finalArgs.options)) {
+    let finalArgs = isRecord23(rootPayload.args) ? { ...rootPayload.args, path: safeRel } : { ...rootPayload, path: safeRel };
+    if (isRecord23(finalArgs.options)) {
       const { baseFile: _baseFile, ...restOptions } = finalArgs.options;
       finalArgs.options = restOptions;
     }
@@ -103828,11 +104071,11 @@ var HarnessRemoteBridge = class {
       const boundedLength = Math.min(rawLength, MAX_READ_BYTES2);
       const normalizedRange = { offset, length: boundedLength };
       if (requiresWorkspaceChangePath(this.harnessVersion)) {
-        finalArgs.options = { ...isRecord22(finalArgs.options) ? finalArgs.options : {}, range: normalizedRange };
+        finalArgs.options = { ...isRecord23(finalArgs.options) ? finalArgs.options : {}, range: normalizedRange };
         delete finalArgs.range;
       } else {
         finalArgs.range = normalizedRange;
-        if (isRecord22(finalArgs.options)) {
+        if (isRecord23(finalArgs.options)) {
           finalArgs.options = { ...finalArgs.options, range: normalizedRange };
         }
       }
@@ -103841,7 +104084,7 @@ var HarnessRemoteBridge = class {
         finalArgs.length = boundedLength;
       }
     }
-    return isRecord22(rootPayload.args) ? { ...rootPayload, args: finalArgs } : finalArgs;
+    return isRecord23(rootPayload.args) ? { ...rootPayload, args: finalArgs } : finalArgs;
   }
   async resolveWorkspaceRootForSession(sessionId, signal) {
     signal.throwIfAborted();
@@ -103951,17 +104194,17 @@ function isPathOutside(rel) {
   return rel.startsWith("../");
 }
 function byteOrLineRange2(args) {
-  const options = isRecord22(args.options) ? args.options : void 0;
-  if (options !== void 0 && isRecord22(options.range)) return options.range;
-  return isRecord22(args.range) ? args.range : args;
+  const options = isRecord23(args.options) ? args.options : void 0;
+  if (options !== void 0 && isRecord23(options.range)) return options.range;
+  return isRecord23(args.range) ? args.range : args;
 }
 function normalizeWorkspaceChangesPayload(endpoint, payload, harnessVersion) {
   if (endpoint !== "workspaceFiles/changes" || !requiresWorkspaceChangePath(harnessVersion)) return payload;
-  if (!isRecord22(payload) || !isRecord22(payload.args) || Object.hasOwn(payload.args, "path")) return payload;
+  if (!isRecord23(payload) || !isRecord23(payload.args) || Object.hasOwn(payload.args, "path")) return payload;
   return { ...payload, args: { ...payload.args, path: "." } };
 }
 function normalizeWorkspaceRequestPayload(endpoint, payload, harnessVersion) {
-  if (!isRecord22(payload) || !isRecord22(payload.args)) return payload;
+  if (!isRecord23(payload) || !isRecord23(payload.args)) return payload;
   const args = payload.args;
   if (endpoint === "workspaceFiles/readBytes" && requiresWorkspaceChangePath(harnessVersion)) {
     if (!Object.hasOwn(args, "range") || Object.hasOwn(args, "options")) return payload;
@@ -103975,10 +104218,10 @@ function normalizeWorkspaceRequestPayload(endpoint, payload, harnessVersion) {
   return payload;
 }
 async function normalizeSessionAttachmentPayload(endpoint, payload, harnessVersion, gateway, signal) {
-  if (endpoint !== "session/attachment" || !isRecord22(payload) || !isRecord22(payload.args)) return payload;
-  const request = isRecord22(payload.args.request) ? payload.args.request : void 0;
+  if (endpoint !== "session/attachment" || !isRecord23(payload) || !isRecord23(payload.args)) return payload;
+  const request = isRecord23(payload.args.request) ? payload.args.request : void 0;
   if (request === void 0) return payload;
-  const attachment = isRecord22(request.attachment) ? request.attachment : void 0;
+  const attachment = isRecord23(request.attachment) ? request.attachment : void 0;
   const attachmentId = attachment !== void 0 && typeof attachment.attachmentId === "string" ? attachment.attachmentId : typeof request.attachmentId === "string" ? request.attachmentId : void 0;
   if (attachmentId === void 0) return payload;
   if (!isDshV022OrNewer(harnessVersion)) {
@@ -104010,7 +104253,7 @@ async function findSessionAttachmentReference(gateway, sessionId, attachmentId, 
       const result = await gateway.dispatch("session/page", { args: { request: pageRequest } }, signal);
       const reference = extractAttachmentReference(result, attachmentId);
       if (reference !== void 0) return reference;
-      if (result.ok === true && isRecord22(result.value)) {
+      if (result.ok === true && isRecord23(result.value)) {
         if (result.value.hasMore === true && typeof result.value.beforeSeq === "number") {
           beforeSeq = result.value.beforeSeq;
           continue;
@@ -104034,7 +104277,7 @@ function extractAttachmentReference(result, attachmentId) {
   const value = result.value;
   let records;
   if (Array.isArray(value)) records = value;
-  else if (isRecord22(value)) {
+  else if (isRecord23(value)) {
     if (Array.isArray(value.records)) records = value.records;
     else if (Array.isArray(value.events)) records = value.events;
   }
@@ -104055,7 +104298,7 @@ function findImageReference(value, attachmentId, depth) {
     return void 0;
   }
   const block = value;
-  const candidate = isRecord22(block.attachment) ? block.attachment : block;
+  const candidate = isRecord23(block.attachment) ? block.attachment : block;
   const candidateId = typeof candidate.attachmentId === "string" ? candidate.attachmentId : void 0;
   if (candidateId === attachmentId && isCompleteImageReference(candidate)) {
     return {
@@ -104205,7 +104448,7 @@ var DANGEROUS_KEYS = /* @__PURE__ */ new Set(["__proto__", "prototype", "constru
 var MAX_WHITELIST_PROJECTION_BYTES = 64 * 1024;
 var MAX_UNKNOWN_PROJECTION_BYTES = 4096;
 function filterSessionProjections(session2) {
-  if (!isRecord22(session2) || !isRecord22(session2.projections) || !isRecord22(session2.projections.values)) {
+  if (!isRecord23(session2) || !isRecord23(session2.projections) || !isRecord23(session2.projections.values)) {
     return session2;
   }
   const originalValues = session2.projections.values;
@@ -104246,15 +104489,15 @@ function trimSessionCatalogRows(endpoint, items) {
   return kept.length <= SESSION_LIST_ROW_BUDGET ? kept : kept.slice().sort((left, right) => updatedAtOf(right) - updatedAtOf(left)).slice(0, SESSION_LIST_ROW_BUDGET);
 }
 function isListableRemoteSession(session2) {
-  return isRecord22(session2) && session2.parentSessionId === void 0 && session2.origin !== "subagent";
+  return isRecord23(session2) && session2.parentSessionId === void 0 && session2.origin !== "subagent";
 }
 function updatedAtOf(session2) {
-  return isRecord22(session2) && typeof session2.updatedAt === "number" ? session2.updatedAt : 0;
+  return isRecord23(session2) && typeof session2.updatedAt === "number" ? session2.updatedAt : 0;
 }
 function withSessionRowTitle(session2) {
-  if (!isRecord22(session2) || typeof session2.title === "string" && session2.title !== "") return session2;
-  const values = isRecord22(session2.projections) ? session2.projections.values : void 0;
-  const title = isRecord22(values) ? values.title : void 0;
+  if (!isRecord23(session2) || typeof session2.title === "string" && session2.title !== "") return session2;
+  const values = isRecord23(session2.projections) ? session2.projections.values : void 0;
+  const title = isRecord23(values) ? values.title : void 0;
   return typeof title === "string" && title !== "" ? { ...session2, title } : session2;
 }
 function filterSessionListProjections(resultOrEndpoint, maybeResult) {
@@ -104263,7 +104506,7 @@ function filterSessionListProjections(resultOrEndpoint, maybeResult) {
   if (endpoint !== void 0 && endpoint !== "session/list" && endpoint !== "session/search") return result;
   if (!result || !result.ok) return result;
   const filterList = (items) => trimSessionCatalogRows(endpoint, items).map(filterSessionProjections).map(withSessionRowTitle);
-  if (isRecord22(result.value)) {
+  if (isRecord23(result.value)) {
     let changed = false;
     const updated = { ...result.value };
     if (Array.isArray(result.value.items)) {
@@ -104287,27 +104530,27 @@ function filterSessionListProjections(resultOrEndpoint, maybeResult) {
 function filterRemotePluginInventory(endpoint, result) {
   if (!result.ok) return result;
   const isRemote = (value) => typeof value === "string" && /^(?:ds-harness-remote|dsh-remote)(?:\/|$)/.test(value);
-  const filterEntries = (entries) => entries.filter((entry) => !isRecord22(entry) || !isRemote(entry.moduleName));
+  const filterEntries = (entries) => entries.filter((entry) => !isRecord23(entry) || !isRemote(entry.moduleName));
   if (endpoint === "pluginManager/listPlugins" && Array.isArray(result.value)) {
     return { ...result, value: filterEntries(result.value) };
   }
   if (endpoint === "pluginManager/listBundles" && Array.isArray(result.value)) {
-    return { ...result, value: result.value.filter((bundle) => !isRecord22(bundle) || !isRemote(bundle.name)).map((bundle) => isRecord22(bundle) && Array.isArray(bundle.rows) ? { ...bundle, rows: filterEntries(bundle.rows) } : bundle) };
+    return { ...result, value: result.value.filter((bundle) => !isRecord23(bundle) || !isRemote(bundle.name)).map((bundle) => isRecord23(bundle) && Array.isArray(bundle.rows) ? { ...bundle, rows: filterEntries(bundle.rows) } : bundle) };
   }
-  if (endpoint === "pluginInventory/list" && isRecord22(result.value) && Array.isArray(result.value.entries)) {
+  if (endpoint === "pluginInventory/list" && isRecord23(result.value) && Array.isArray(result.value.entries)) {
     return { ...result, value: { ...result.value, entries: filterEntries(result.value.entries) } };
   }
   return result;
 }
 function requestArgs(payload) {
   const root2 = record10(payload);
-  const args = isRecord22(root2.args) ? root2.args : root2;
+  const args = isRecord23(root2.args) ? root2.args : root2;
   return record10(args.request ?? args._request ?? args);
 }
 function record10(value) {
-  return isRecord22(value) ? value : {};
+  return isRecord23(value) ? value : {};
 }
-function isRecord22(value) {
+function isRecord23(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function isCompactSnapshot(value) {
@@ -104316,7 +104559,7 @@ function isCompactSnapshot(value) {
 function remoteOwnedBundleRow(row, plugin) {
   const remoteModule = (value) => typeof value === "string" && /^(?:ds-harness-remote|dsh-remote)(?:\/|$)/.test(value);
   if (remoteModule(plugin ? row.moduleName : row.name)) return true;
-  return !plugin && (!Array.isArray(row.rows) || row.rows.some((value) => !isRecord22(value) || remoteModule(value.moduleName)) || Array.isArray(row.overrides) && row.overrides.some((value) => remoteModule(value)));
+  return !plugin && (!Array.isArray(row.rows) || row.rows.some((value) => !isRecord23(value) || remoteModule(value.moduleName)) || Array.isArray(row.overrides) && row.overrides.some((value) => remoteModule(value)));
 }
 
 // packages/plugin/src/remote-compaction-operations.ts
@@ -104330,11 +104573,11 @@ var MAX_OPERATIONS = 32;
 function requestIndexKey(ownerDeviceId, sessionId, requestId) {
   return `${ownerDeviceId}\0${sessionId}\0${requestId}`;
 }
-function isRecord23(value) {
+function isRecord24(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function commandIdOf(result) {
-  if (result?.ok !== true || !isRecord23(result.value)) return void 0;
+  if (result?.ok !== true || !isRecord24(result.value)) return void 0;
   return typeof result.value.commandId === "string" ? result.value.commandId : void 0;
 }
 var RemoteCompactionOperations = class {
@@ -104597,13 +104840,13 @@ function clampBudget(value) {
   return Math.min(Math.max(value, MIN_BUDGET_MS), MAX_BUDGET_MS);
 }
 function isCommandSuccess(result) {
-  if (result.ok !== true || !isRecord23(result.value)) return false;
-  const command = isRecord23(result.value.result) ? result.value.result : void 0;
+  if (result.ok !== true || !isRecord24(result.value)) return false;
+  const command = isRecord24(result.value.result) ? result.value.result : void 0;
   return command?.kind === "success";
 }
 function commandText2(result) {
-  if (result.ok !== true || !isRecord23(result.value)) return void 0;
-  const command = isRecord23(result.value.result) ? result.value.result : void 0;
+  if (result.ok !== true || !isRecord24(result.value)) return void 0;
+  const command = isRecord24(result.value.result) ? result.value.result : void 0;
   return typeof command?.text === "string" && command.text.trim() !== "" ? command.text : void 0;
 }
 function sanitizeMessage(message) {
@@ -104613,31 +104856,31 @@ function delay(ms) {
   return new Promise((resolve10) => setTimeout(resolve10, ms));
 }
 function readCompactionConfirmation(result, acceptedAt, commandId) {
-  if (result.ok !== true || !isRecord23(result.value)) return { kind: "unknown" };
+  if (result.ok !== true || !isRecord24(result.value)) return { kind: "unknown" };
   const records = Array.isArray(result.value.records) ? result.value.records : [];
   const legacy = Array.isArray(result.value.events) ? result.value.events : [];
   const events = [];
   for (const record11 of [...records, ...legacy]) {
-    const event = isRecord23(record11) && isRecord23(record11.event) ? record11.event : record11;
-    if (isRecord23(event) && typeof event.type === "string") events.push(event);
+    const event = isRecord24(record11) && isRecord24(record11.event) ? record11.event : record11;
+    if (isRecord24(event) && typeof event.type === "string") events.push(event);
   }
   if (events.length === 0) return { kind: "unknown" };
   const resolvedCommandId = commandId ?? latestCompactCommandId(events, acceptedAt);
   if (resolvedCommandId === void 0) return { kind: "not-yet" };
   const end = [...events].reverse().find((event) => {
     if (event.type !== "compaction/end") return false;
-    const data3 = isRecord23(event.data) ? event.data : void 0;
+    const data3 = isRecord24(event.data) ? event.data : void 0;
     return data3?.sourceCommandId === resolvedCommandId;
   });
   if (end === void 0) return { kind: "not-yet" };
-  const data2 = isRecord23(end.data) ? end.data : {};
+  const data2 = isRecord24(end.data) ? end.data : {};
   const error62 = data2.error === void 0 ? void 0 : errorText(data2.error);
   return error62 === void 0 ? { kind: "finished" } : { kind: "finished", error: error62 };
 }
 function latestCompactCommandId(events, acceptedAt) {
   for (const event of [...events].reverse()) {
     if (event.type !== "command/run") continue;
-    const data2 = isRecord23(event.data) ? event.data : void 0;
+    const data2 = isRecord24(event.data) ? event.data : void 0;
     if (data2?.name !== "compact" || typeof data2.commandId !== "string") continue;
     const time3 = typeof event.time === "number" ? event.time : 0;
     if (time3 !== 0 && time3 < acceptedAt - 5e3) continue;
@@ -104647,7 +104890,7 @@ function latestCompactCommandId(events, acceptedAt) {
 }
 function errorText(error62) {
   if (typeof error62 === "string") return sanitizeMessage(error62);
-  if (isRecord23(error62)) {
+  if (isRecord24(error62)) {
     const message = error62.message ?? error62.error ?? error62.reason;
     if (typeof message === "string" && message.trim() !== "") return sanitizeMessage(message);
     try {
@@ -105786,21 +106029,21 @@ var LocalPluginUpgrade = class {
 };
 function bundleUpdatable(listed, packageName) {
   if (!Array.isArray(listed)) return false;
-  return listed.some((row) => isRecord24(row) && row.name === packageName && (row.update === "registry" || row.update === void 0 && row.updatable === true));
+  return listed.some((row) => isRecord25(row) && row.name === packageName && (row.update === "registry" || row.update === void 0 && row.updatable === true));
 }
 function classifyUpdateResult(result) {
-  if (!isRecord24(result) || !isRecord24(result.result)) return { status: "failed", message: "update-failed" };
+  if (!isRecord25(result) || !isRecord25(result.result)) return { status: "failed", message: "update-failed" };
   const application = result.result.application;
   if (application === "applied" || application === "restart-required") return { status: "started" };
   return { status: "failed", message: failureMessage(result.result.error) };
 }
 function failureMessage(error62) {
-  if (!isRecord24(error62)) return "update-failed";
+  if (!isRecord25(error62)) return "update-failed";
   const code = typeof error62.code === "string" && error62.code.length > 0 && error62.code.length <= 80 ? error62.code : "update-failed";
   const diagnostic = typeof error62.diagnostic === "string" ? error62.diagnostic.replace(/\s+/g, " ").trim().slice(0, 180) : "";
   return diagnostic === "" ? code : `${code}: ${diagnostic}`;
 }
-function isRecord24(value) {
+function isRecord25(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
