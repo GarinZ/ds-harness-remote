@@ -20,6 +20,7 @@ import type { SafeLogger } from './logging.js'
 import type { CodexPeerBridge } from './codex/peer-bridge.js'
 import type { AcpPeerBridge } from './acp/peer-bridge.js'
 import { RpcError, safeErrorCode, workspaceFileFailureReason } from './safe-error.js'
+import { RESULT_ONLY_CAPABILITY } from './result-only.js'
 import type { WorkspaceUploadHost } from './workspace-upload.js'
 import type { PluginRouteBridge } from './plugin-route-bridge.js'
 import type { RemoteCompactionOperations, RemoteCompactionOwner } from './remote-compaction-operations.js'
@@ -190,7 +191,7 @@ export class RpcRouter {
         const hostCapabilities = (await this.capabilities()).filter(capability => capability !== BINARY_UPLOAD_CAPABILITY && capability !== LAN_UPLOAD_CAPABILITY)
         const remoteAvailable = hostCapabilities.includes('harness.remote.v1') || hostCapabilities.includes('harness.remote.v3')
         const capabilities = [...new Set([...hostCapabilities, 'remote.history.compact.v1',
-          ...(this.harnessRemote === undefined || !remoteAvailable ? [] : ['harness.remote.stream.transfer.v1']),
+          ...(this.harnessRemote === undefined || !remoteAvailable ? [] : ['harness.remote.stream.transfer.v1', RESULT_ONLY_CAPABILITY]),
           ...(this.compaction === undefined ? [] : [REMOTE_COMPACTION_CAPABILITY]),
           ...(this.workspaceUpload === undefined || !hostCapabilities.includes('workspace.upload.v1') ? [] : [BINARY_UPLOAD_CAPABILITY, ...(this.lanUpload ? [LAN_UPLOAD_CAPABILITY] : [])]),
           ...(this.transportUpgrade === undefined ? [] : [TRANSPORT_UPGRADE_CAPABILITY]),
