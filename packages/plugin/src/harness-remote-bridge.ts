@@ -1,4 +1,5 @@
 import { compactHistory } from './compact-history.js'
+import { RESULT_ONLY_HISTORY_ENDPOINTS, filterResultOnly, resultOnlyStream, takeResultOnly } from './result-only.js'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { lstat, realpath, stat } from 'node:fs/promises'
@@ -312,6 +313,12 @@ export class HarnessRemoteBridge {
 
   async call(input: unknown): Promise<TypertRpcResult> {
     const params = callSchema.parse(input) as HarnessRemoteCallParams
+    // Only session history endpoints understand the flag; leave every other
+    // payload byte-for-byte alone.
+    const extracted = RESULT_ONLY_HISTORY_ENDPOINTS.has(params.endpoint)
+      ? takeResultOnly(params.payload)
+      : { payload: params.payload, resultOnly: false }
+    params.payload = extracted.payload
     if ((params.endpoint === 'remoteUploads/upload' || params.endpoint === 'remoteImages/upload') && this.uploadAttachment !== undefined) {
       const payload = z.object({ args: z.unknown() }).strict().parse(params.payload)
       return { ok: true, value: await this.uploadAttachment(payload.args) }
@@ -376,9 +383,10 @@ export class HarnessRemoteBridge {
       // to canonical base64. (Codex/ACP workspace bridges already return the
       // wire shape and are left unchanged.)
       const filteredResult = filterSessionListProjections(params.endpoint, result)
+      const resultOnlyResult = extracted.resultOnly ? filterResultOnly(params.endpoint, filteredResult) : filteredResult
       const wireResult = normalizeWorkspaceBinaryResult(params.endpoint,
         this.compactHistoryEnabled && ['session/page', 'session/events', 'session/history', 'subagent/history'].includes(params.endpoint)
-          ? compactHistory(filteredResult) : filteredResult)
+          ? compactHistory(resultOnlyResult) : resultOnlyResult)
       return reservation === undefined ? wireResult : this.terminal.result(params.endpoint, params.payload, wireResult, reservation)
     } catch (error) {
       if (reservation !== undefined) this.terminal.result(params.endpoint, params.payload, { ok: false, error: { code: 'FAILED', message: '', details: {} } }, reservation)
@@ -566,6 +574,10 @@ export class HarnessRemoteBridge {
 
   async openStream(input: unknown): Promise<{ opened: true; streamId: string }> {
     const params = streamOpenSchema.parse(input) as HarnessRemoteStreamOpenParams
+    const extracted = params.endpoint === 'session/follow'
+      ? takeResultOnly(params.payload)
+      : { payload: params.payload, resultOnly: false }
+    params.payload = extracted.payload
     this.assertAllowed(params.endpoint)
     if (params.endpoint.startsWith('pluginManager/')) throw new RpcError('METHOD_NOT_ALLOWED', 'Plugin management endpoints are not streams.')
     if (params.endpoint.startsWith('settings/')) throw new RpcError('METHOD_NOT_ALLOWED', 'Settings endpoints are not streams.')
@@ -590,7 +602,7 @@ export class HarnessRemoteBridge {
       throw error
     }
     if (params.endpoint === '$events') source = this.remoteEventsWithFallback(source, controller.signal)
-    void this.pump(params.streamId, source, controller.signal, params.endpoint === 'session/follow', params.transferFrames)
+    void this.pump(params.streamId, source, controller.signal, params.endpoint === 'session/follow', params.transferFrames, extracted.resultOnly)
     return { opened: true, streamId: params.streamId }
   }
 
@@ -712,11 +724,11 @@ export class HarnessRemoteBridge {
     }
   }
 
-  private async pump(streamId: string, source: AsyncIterable<unknown>, signal: AbortSignal, historyFollow = false, transferFrames = false): Promise<void> {
+  private async pump(streamId: string, source: AsyncIterable<unknown>, signal: AbortSignal, historyFollow = false, transferFrames = false, resultOnly = false): Promise<void> {
     let reason: HarnessRemoteStreamClosedData['reason'] = 'completed'
     let failure: HarnessRemoteStreamClosedData['failure']
     try {
-      for await (const value of source) {
+      for await (const value of resultOnly ? resultOnlyStream(source, signal) : source) {
         if (signal.aborted) break
         const frame: HarnessRemoteFrameData = {
           streamId,
